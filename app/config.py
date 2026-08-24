@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     MAX_CACHE_RESULTS: int = 1
     REDIS_HOST: str = os.getenv("REDIS_HOST", "localhost")
     REDIS_PORT: int = int(os.getenv("REDIS_PORT", 6379))
+    REDIS_DB: int = int(os.getenv("REDIS_DB", 0))
     REDIS_PASSWORD: str = os.getenv("REDIS_PASSWORD", "")
     REDIS_CACHE_TTL: int = int(os.getenv("REDIS_CACHE_TTL", 86400))  # 24 hours in seconds
     REDIS_MAX_CACHE_SIZE: int = int(os.getenv("REDIS_MAX_CACHE_SIZE", 1000))

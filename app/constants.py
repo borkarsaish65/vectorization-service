@@ -1,0 +1,1 @@
+ACRONYM_CACHE_KEY_PREFIX = "acronym"
