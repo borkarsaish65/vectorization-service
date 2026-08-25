@@ -28,7 +28,7 @@ async def lifespan(app: FastAPI):
         # loop (and every other in-flight request) for its full duration.
         await run_in_threadpool(load_acronym_cache)
     except Exception as e:
-        # Not fatal: get_expansion() already falls back to Postgres per lookup,
+        # Not fatal: get_expansions_batch() already falls back to Postgres per lookup,
         # so a failed warm-up only costs a few extra DB round-trips on first
         # touch — it must not take down the whole service (e.g. a fresh
         # deploy where the migration hasn't run yet, or a transient Redis

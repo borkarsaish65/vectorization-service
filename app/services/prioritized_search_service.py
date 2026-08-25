@@ -1,4 +1,5 @@
 import logging
+import re
 import time
 from typing import List, Dict, Optional, Any, Set
 from qdrant_client import models
@@ -10,6 +11,7 @@ from app.core.clients.qdrant import qdrant_client
 from app.core.clients import embedding
 from app.core.clients.embedding import EmbeddingError
 from app.config import settings
+from app.services.acronym_query_service import detect_acronyms
 from app.models.api_models import (
     PrioritizedSearchRequest,
     PrioritizedSearchResponse,
@@ -77,18 +79,20 @@ class PrioritizedSearchService:
         else:
             logger.info("No filters applied")
 
-    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None):
+    def _process_and_filter_results(self, all_results, field_scores, weights, search_fields, top_k, threshold, detail_filter_score=None, scoring_context_out=None, is_acronym_query=False):
         """Process, rank, filter and deduplicate results.
 
         scoring_context_out: optional mutable dict forwarded to _rank_results so the
         caller can capture the per-query normalization context (min/max/pool size).
+        is_acronym_query: forwarded to _rank_results — see its docstring. Defaults to
+        False so any other caller reproduces the pre-existing fixed-blend behavior.
         """
         logger.info(f"Total documents matched: {len(all_results)}")
 
         logger.info("Calculating weighted scores and ranking results")
-        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out)
+        ranked_results = self._rank_results(all_results, field_scores, weights, search_fields, scoring_context_out, is_acronym_query=is_acronym_query)
         logger.info(f"Ranked results: {len(ranked_results)} documents")
-        
+
         # Apply filtering based on conditions
         if detail_filter_score is not None:
             logger.info("Applying detail_filter_score (field-level thresholds with OR logic)")
@@ -96,13 +100,13 @@ class PrioritizedSearchService:
         else:
             logger.info(f"Applying filter_score threshold: {threshold}")
             filtered_results = [r for r in ranked_results if r['weighted_score'] >= threshold]
-        
+
         logger.info(f"After filtering: {len(filtered_results)} documents (removed {len(ranked_results) - len(filtered_results)})")
-        
+
         logger.info("Deduplicating by source_id (keeping best match per source)")
         unique_source_results = self._filter_best_per_source(filtered_results)
         logger.info(f"Unique sources: {len(unique_source_results)}")
-        
+
         top_results = unique_source_results[:top_k]
         logger.info(f"Returning top {len(top_results)} results")
         
@@ -259,36 +263,100 @@ class PrioritizedSearchService:
             # content words (e.g. "ministry of education" → "ministry education"). See CLAUDE.md §15.
             query_for_keyword_match = request.query
 
-            logger.info(f"Generating embedding for query: '{query_for_embedding}'")
+            acronyms_detected = {}
+            if settings.ACRONYM_SEARCH_ENABLED:
+                acronyms_detected = detect_acronyms(query_for_keyword_match)
+                if acronyms_detected:
+                    logger.info(f"Acronyms detected in query: {list(acronyms_detected.keys())}")
+
+            # Surfaced in the response as acronym_info so callers can see what was
+            # detected/expanded, independent of ACRONYM_SEARCH_ENABLED — null when
+            # nothing was detected (or the flag is off).
+            acronym_info = {"detected": True, "mapping": acronyms_detected} if acronyms_detected else None
+
+            # Acronym path: 2 separate dense query strings (never concatenated —
+            # embedding "PTM meeting" + "Parent Teacher Meeting" together would
+            # average two concepts into one point in vector space, close to
+            # neither) + 1 combined sparse OR string. Non-acronym queries (or
+            # nothing detected) fall through unchanged below.
+            dense_query_texts = [query_for_embedding]
+            sparse_query_text = query_for_embedding
+            if acronyms_detected:
+                # Single regex pass over the ORIGINAL text, not sequential
+                # substitutions — looping could re-scan an expansion that itself
+                # contains another acronym (e.g. NFST -> "...for ST" when ST is
+                # also detected), producing garbled, duplicated text.
+                combined_pattern = re.compile(
+                    r"\b(?:" + "|".join(re.escape(a) for a in acronyms_detected) + r")\b",
+                    re.IGNORECASE,
+                )
+
+                def _resolve_acronym(match: re.Match) -> str:
+                    # A callable, not a string replacement — re.sub treats
+                    # backslashes in a string replacement specially, so an
+                    # expansion containing one (e.g. a Windows path) would crash
+                    # or corrupt the text. .upper() maps back to the mapping's
+                    # uppercase key regardless of the matched text's case.
+                    return acronyms_detected[match.group(0).upper()][0]
+
+                substituted = combined_pattern.sub(_resolve_acronym, query_for_embedding)
+                # A case-only diff isn't a real second reading — embeddings are
+                # case-insensitive in practice (cosine sim 1.0) — so only add the
+                # substituted variant as a second dense query when it's a genuine
+                # semantic change (spec §9: first expansion only, for one
+                # coherent embeddable sentence).
+                if substituted.lower() != query_for_embedding.lower():
+                    dense_query_texts = [query_for_embedding, substituted]
+
+                # Sparse: append every expansion word (not just the first, unlike
+                # the dense pick above) — more ways to match, no dilution risk
+                # for a bag-of-words BM25 search. Plain word-appending, not
+                # boolean/phrase syntax — the BM25 tokenizer has no notion of
+                # OR or quoted phrases.
+                expansion_words = " ".join(
+                    expansion
+                    for expansions in acronyms_detected.values()
+                    for expansion in expansions
+                )
+                sparse_query_text = f"{query_for_keyword_match} {expansion_words}"
+
+            logger.info(f"Generating {len(dense_query_texts)} dense embedding(s) for query: {dense_query_texts}")
             # embed_query rejects empty/whitespace input and validates the produced
             # vector (length == EMBEDDING_DIM, finite values) so a malformed vector can
             # never reach Qdrant. Returns a validated list[float].
-            try:
-                query_embedding = embedding.embed_query(query_for_embedding)
-            except EmbeddingError as e:
-                logger.error(
-                    "Query embedding invalid: service=prioritized_search "
-                    f"query='{query_for_embedding[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
-                    f"error={e}"
-                )
-                raise
-            
+            query_embeddings = []
+            for dense_query_text in dense_query_texts:
+                try:
+                    query_embeddings.append(embedding.embed_query(dense_query_text))
+                except EmbeddingError as e:
+                    logger.error(
+                        "Query embedding invalid: service=prioritized_search "
+                        f"query='{dense_query_text[:80]}' expected_dim={embedding.EMBEDDING_DIM} "
+                        f"error={e}"
+                    )
+                    raise
+
             filter_conditions = self._build_filters(
                 categories=request.categories,
                 organizations=request.organizations,
                 resource_types=request.resource_type,
                 file_types=request.file_type
             )
-            
+
             self._log_search_request(request, top_k, filter_conditions)
             
             logger.info("========== EXECUTING SEARCH ==========" )
+            # query_embeddings is a single-element list unless acronym detection
+            # produced a substituted variant (built above) — either way,
+            # _hybrid_batch_search/_parallel_batch_search fan out per field per
+            # embedding and merge same-field hits with max(), which is a no-op for
+            # the single-embedding case.
             if settings.SPARSE_SEARCH_ENABLED:
                 logger.info("Starting hybrid batch search (dense + BM25 sparse, RRF fusion)")
                 all_results, field_scores = self._hybrid_batch_search(
                     search_fields=search_fields,
-                    query_text=query_for_embedding,
-                    query_embedding=query_embedding,
+                    query_text=sparse_query_text,
+                    query_embeddings=query_embeddings,
                     filter_conditions=filter_conditions,
                     # Bounded candidate pool per field — keeps HNSW ef small (dominant
                     # query cost). See _candidate_limit / SEARCH_CANDIDATE_* config.
@@ -299,12 +367,12 @@ class PrioritizedSearchService:
                 all_results, field_scores = self._parallel_batch_search(
                     search_fields=search_fields,
                     weights=weights,
-                    query_embedding=query_embedding,
+                    query_embeddings=query_embeddings,
                     filter_conditions=filter_conditions,
                     # Bounded candidate pool per field (see note above).
                     limit=self._candidate_limit(top_k),
                 )
-            
+
             if not all_results:
                 logger.info("========== SEARCH RESULTS ==========" )
                 logger.info("No results found")
@@ -319,9 +387,10 @@ class PrioritizedSearchService:
                         "priority_order": self.priority_order,
                         "filters_applied": filter_conditions is not None,
                         "filter_mode": "detail_filter_score" if use_detail_filter else "filter_score"
-                    }
+                    },
+                    acronym_info=acronym_info
                 )
-            
+
             # Pass detail_filter_score if using field-level filtering.
             # scoring_context captures the per-query normalization reference (min/max/pool)
             # computed inside _rank_results; surfaced under search_config.scoring_context
@@ -332,6 +401,7 @@ class PrioritizedSearchService:
                 filter_score if not use_detail_filter else 0,
                 detail_filter_score if use_detail_filter else None,
                 scoring_context_out=scoring_context,
+                is_acronym_query=bool(acronyms_detected),
             )
 
             # Apply title boost when hybrid mode is active.
@@ -347,24 +417,38 @@ class PrioritizedSearchService:
 
                 # Title boost (highest priority). Scroll retrieves prefix/partial
                 # matches; the supplement adds any mid/infix matches already present
-                # in the dense candidate pool that the scroll missed.
+                # in the dense candidate pool that the scroll missed. Checks the
+                # literal query text plus every detected acronym's expansion(s) in
+                # one combined call — a document titled with the acronym's actual
+                # expansion ("Social Science / Social Studies") gets the same credit
+                # a literal acronym match ("SST") would, without a separate Qdrant
+                # round-trip per expansion (see _get_field_match_sources' docstring).
+                title_queries = [query_for_keyword_match]
+                if acronyms_detected:
+                    for expansions in acronyms_detected.values():
+                        title_queries.extend(expansions)
                 title_matches = self._get_field_match_sources(
-                    query_for_keyword_match, filter_conditions, "title"
+                    title_queries, filter_conditions, "title"
                 )
                 self._supplement_matches_from_results(
-                    query_for_keyword_match, unique_source_results, "title", title_matches
+                    title_queries, unique_source_results, "title", title_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, title_matches, "title",
                     settings.EXACT_TITLE_BOOST, settings.PARTIAL_TITLE_BOOST,
                 )
 
-                # Summary boost (lower priority, applied after title).
+                # Summary boost (lower priority, applied after title). Same
+                # expansion-awareness as the title boost above.
+                summary_queries = [query_for_keyword_match]
+                if acronyms_detected:
+                    for expansions in acronyms_detected.values():
+                        summary_queries.extend(expansions)
                 summary_matches = self._get_field_match_sources(
-                    query_for_keyword_match, filter_conditions, "summary"
+                    summary_queries, filter_conditions, "summary"
                 )
                 self._supplement_matches_from_results(
-                    query_for_keyword_match, unique_source_results, "summary", summary_matches
+                    summary_queries, unique_source_results, "summary", summary_matches
                 )
                 top_results = self._apply_field_boost(
                     top_results, summary_matches, "summary",
@@ -481,7 +565,8 @@ class PrioritizedSearchService:
                 total_results=total_results,
                 top_k=top_k,
                 results=result_items,
-                search_config=search_config
+                search_config=search_config,
+                acronym_info=acronym_info
             )
             
         except ValueError as e:
@@ -495,50 +580,59 @@ class PrioritizedSearchService:
         self,
         search_fields: List[str],
         weights: Dict[str, float],
-        query_embedding: Any,
+        query_embeddings: List[Any],
         filter_conditions: Optional[models.Filter],
         limit: int
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
         """
         Execute parallel batch search across multiple vector fields.
-        
-        Uses Qdrant's native search_batch for optimal performance.
-        
+
+        Uses Qdrant's native search_batch for optimal performance. Fans a batch of
+        dense requests out across BOTH search_fields and query_embeddings (one
+        request per field per embedding) in a single Qdrant batch call, then merges
+        results back per field with max() — the non-acronym path always passes a
+        single-element list, so the merge is a no-op there; the acronym path passes
+        the original + acronym-substituted embeddings, where the same point can be
+        scored twice for the same field (once per embedding).
+
         Args:
             search_fields: Field names to search (title, tags, summary, metadata, text)
             weights: Weight configuration for each field
-            query_embedding: Query embedding vector
+            query_embeddings: List of query embedding vectors (a single-element list
+                for a normal query; original + acronym-substituted when acronym
+                detection produced more than one).
             filter_conditions: Optional Qdrant filter conditions
             limit: Number of results to retrieve per field
-            
+
         Returns:
             Tuple of (all_results dict, field_scores dict)
         """
         search_requests = []
         valid_fields = []
 
-        # Defense-in-depth: validate the dense vector immediately before it is sent to
-        # Qdrant. query_embedding is already a validated list from embed_query, but this
+        # Defense-in-depth: validate each dense vector immediately before it is sent to
+        # Qdrant. Each embedding is already a validated list from embed_query, but this
         # guards against any future caller passing a raw/empty vector.
-        dense_vector = embedding.validate_vector(query_embedding)
+        dense_vectors = [embedding.validate_vector(vec) for vec in query_embeddings]
 
         for field in search_fields:
             if field not in weights:
                 logger.warning(f"Field '{field}' not in weights config, skipping")
                 continue
 
-            search_requests.append(
-                QueryRequest(
-                    query=dense_vector,
-                    using=field,
-                    limit=limit,
-                    with_payload=True,
-                    filter=filter_conditions
+            for dense_vector in dense_vectors:
+                search_requests.append(
+                    QueryRequest(
+                        query=dense_vector,
+                        using=field,
+                        limit=limit,
+                        with_payload=True,
+                        filter=filter_conditions
+                    )
                 )
-            )
-            valid_fields.append(field)
-        
-        logger.info(f"Executing batch search across {len(valid_fields)} fields: {valid_fields}")
+                valid_fields.append(field)
+
+        logger.info(f"Executing batch search across {len(valid_fields)} field/query-variant combinations")
         batch_results = qdrant_client.query_batch_points(
             collection_name=self.collection_name,
             requests=search_requests
@@ -550,33 +644,46 @@ class PrioritizedSearchService:
         for field, query_response in zip(valid_fields, batch_results):
             results = query_response.points
             logger.info(f"Field '{field}' returned {len(results)} results")
-            
+
             for result in results:
                 point_id = result.id
                 if point_id not in all_results:
                     all_results[point_id] = result
                     field_scores[point_id] = {}
-                
-                field_scores[point_id][field] = result.score
-        
+
+                # max(), not overwrite: with multiple query embeddings, the same point
+                # can be scored twice for the same field (once per embedding) — keep
+                # whichever embedding matched it best instead of the last one seen.
+                existing = field_scores[point_id].get(field, float("-inf"))
+                field_scores[point_id][field] = max(existing, result.score)
+
         logger.info(f"Batch search completed: {len(all_results)} unique documents found")
         return all_results, field_scores
-    
+
     def _hybrid_batch_search(
         self,
         search_fields: List[str],
         query_text: str,
-        query_embedding: Any,
+        query_embeddings: List[Any],
         filter_conditions: Optional[models.Filter],
         limit: int,
     ) -> tuple[Dict[str, Any], Dict[str, Dict[str, float]]]:
         """Execute hybrid search using parallel batch queries with client-side RRF fusion.
 
-        This maintains keyword (BM25 sparse) search active while exposing raw field-level 
+        This maintains keyword (BM25 sparse) search active while exposing raw field-level
         similarity scores for detail_filter_score verification.
 
         To minimize network bandwidth and memory footprint, payloads are projected to exclude
         heavy text content; full payloads are fetched late for the final top results.
+
+        Fans dense requests out across BOTH search_fields and query_embeddings (one
+        request per field per embedding), bundled with the single BM25 sparse request
+        into one Qdrant batch call, merging same-field hits back with max() — the
+        non-acronym path always passes a single-element list, so the merge is a no-op
+        there; the acronym path can score the same point twice for the same field
+        (once per embedding). query_text (for the single BM25 sparse request — sparse
+        fan-out is a string-level OR, not multiple requests) is expected to already
+        carry any acronym OR-expansion baked in by the caller.
         """
         try:
             from qdrant_client.models import QueryRequest, SparseVector
@@ -585,9 +692,9 @@ class PrioritizedSearchService:
             search_requests = []
             valid_fields = []
 
-            # Defense-in-depth: validate the dense vector before it reaches Qdrant
+            # Defense-in-depth: validate each dense vector before it reaches Qdrant
             # (prevents the "expected dim: 384, got 0" batch 400).
-            dense_vector = embedding.validate_vector(query_embedding)
+            dense_vectors = [embedding.validate_vector(vec) for vec in query_embeddings]
 
             # Project payload to retrieve only small metadata keys needed for filters and boosts.
             # Excludes the heavy 'text' payload field during candidate scoring.
@@ -596,16 +703,17 @@ class PrioritizedSearchService:
             # 1. Build Query Requests for Dense Fields
             for field in search_fields:
                 if field in self.default_weights:
-                    search_requests.append(
-                        QueryRequest(
-                            query=dense_vector,
-                            using=field,
-                            limit=limit,
-                            with_payload=metadata_payload_fields,
-                            filter=filter_conditions
+                    for dense_vector in dense_vectors:
+                        search_requests.append(
+                            QueryRequest(
+                                query=dense_vector,
+                                using=field,
+                                limit=limit,
+                                with_payload=metadata_payload_fields,
+                                filter=filter_conditions
+                            )
                         )
-                    )
-                    valid_fields.append(field)
+                        valid_fields.append(field)
 
             # 2. Build Query Request for BM25 Sparse Field
             # Replace underscores with spaces so BM25 tokenises compound
@@ -629,7 +737,7 @@ class PrioritizedSearchService:
                 valid_fields.append(settings.SPARSE_VECTOR_NAME)
 
             logger.info(f"Executing client-side hybrid batch search across {len(valid_fields)} fields: {valid_fields}")
-            
+
             # 3. Execute all queries in a single network batch call
             import time
             t0 = time.time()
@@ -657,8 +765,12 @@ class PrioritizedSearchService:
                     all_results[pid] = point
                     if pid not in field_scores:
                         field_scores[pid] = {}
-                    # Store individual raw similarity score for the field (for detail_filter_score check)
-                    field_scores[pid][field] = getattr(point, "score", 0.0)
+                    # max(), not overwrite: with multiple dense embeddings for the same
+                    # field (acronym path), the same point can be scored twice for that
+                    # field — keep whichever embedding matched it best.
+                    score = getattr(point, "score", 0.0)
+                    existing = field_scores[pid].get(field, float("-inf"))
+                    field_scores[pid][field] = max(existing, score)
 
             # 5. Remap raw Qdrant vector-field names to the semantic field names that
             #    _apply_detail_filter checks against ("title", "text", "tags",
@@ -704,7 +816,7 @@ class PrioritizedSearchService:
             return self._parallel_batch_search(
                 search_fields=search_fields,
                 weights=self.default_weights,
-                query_embedding=query_embedding,
+                query_embeddings=query_embeddings,
                 filter_conditions=filter_conditions,
                 limit=limit,
             )
@@ -830,6 +942,7 @@ class PrioritizedSearchService:
         weights: Dict[str, float],
         search_fields: List[str],
         scoring_context_out: Optional[Dict[str, Any]] = None,
+        is_acronym_query: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Rank results using weighted multi-field scoring.
@@ -869,6 +982,12 @@ class PrioritizedSearchService:
                 under search_config.scoring_context without recomputing raw_dense/raw_sparse
                 or keeping per-request state on the (shared) service instance. Left empty
                 on the dense-only path except for candidate_pool_size.
+            is_acronym_query: When True (query had a detected acronym),
+                per-point dense/sparse weights are flipped for any point with a genuine
+                sparse hit — see the weighted-fusion branch below. False (the default,
+                and always false when ACRONYM_SEARCH_ENABLED is off or nothing detected)
+                reproduces the original fixed HYBRID_DENSE_WEIGHT/HYBRID_SPARSE_WEIGHT
+                blend for every point, unchanged.
 
         Returns:
             List of ranked results sorted by weighted score (descending)
@@ -939,11 +1058,21 @@ class PrioritizedSearchService:
                 norm_sparse = self._min_max_normalize(raw_sparse)
                 dense_w = settings.HYBRID_DENSE_WEIGHT
                 sparse_w = settings.HYBRID_SPARSE_WEIGHT
+                # Acronym-scoped reweighting: min-max normalizes dense/sparse
+                # independently, so a weak dense pool can still hit 1.0 and outrank
+                # a genuine keyword match — especially for short acronym queries.
+                # When is_acronym_query and a point has a real sparse hit, score it
+                # both ways and take the max (never just the flipped value) — a
+                # keyword match can only raise a score, never lower it.
                 for point_id in raw_dense:
-                    hybrid_scores[point_id] = (
-                        dense_w * norm_dense.get(point_id, 0.0)
-                        + sparse_w * norm_sparse.get(point_id, 0.0)
-                    )
+                    nd = norm_dense.get(point_id, 0.0)
+                    ns = norm_sparse.get(point_id, 0.0)
+                    base_score = dense_w * nd + sparse_w * ns
+                    if is_acronym_query and raw_sparse.get(point_id, 0.0) > 0.0:
+                        flipped_score = sparse_w * nd + dense_w * ns
+                        hybrid_scores[point_id] = max(base_score, flipped_score)
+                    else:
+                        hybrid_scores[point_id] = base_score
 
             # Expose the per-query normalization reference (min/max of each modality
             # across the candidate pool) so a debug caller can reproduce normalized_dense/
@@ -1173,38 +1302,51 @@ class PrioritizedSearchService:
 
     def _get_field_match_sources(
         self,
-        query: str,
+        queries: List[str],
         filter_conditions: Optional[models.Filter],
         field: str,
     ) -> Dict[str, str]:
         """Return a map of source_id → match_type ('exact'|'partial') for documents
-        whose ``field`` payload (e.g. 'title' or 'summary') contains the query string.
+        whose ``field`` payload (e.g. 'title' or 'summary') contains any of ``queries``.
 
-        Uses a MatchText payload filter against the prefix-tokenized index, then refines
-        with a Python substring check so prefix and mid/infix occurrences are classified.
-        The scroll retrieves all matching points (batched) so no relevant document is missed.
+        Takes a list — the literal query text plus every detected acronym's
+        expansion(s) — so all of them are checked in a single Qdrant round-trip
+        (one scroll with an OR/``should`` filter) instead of one scroll per text.
+        Classification is done as if each text had its own sequential scroll:
+        for each query text in order, a source_id already recorded as "exact"
+        is left alone, otherwise the first point (chunk) of that source found to
+        match is classified and recorded — reproducing the same "first match
+        wins per text, later texts can upgrade partial to exact" behavior as N
+        separate calls, since a should-filter can only return the union of what
+        N individual MatchText filters would each return on their own (never
+        fewer points), just fetched once.
+
+        Uses a MatchText payload filter against the prefix-tokenized index, then
+        refines with a Python substring check per query text so prefix and
+        mid/infix occurrences are classified. The scroll retrieves all matching
+        points (batched) so no relevant document is missed.
         """
         matches: Dict[str, str] = {}
-        query_lower = query.strip().lower()
-        if not query_lower:
+        queries_lower = list(dict.fromkeys(q.strip().lower() for q in queries if q and q.strip()))
+        if not queries_lower:
             return matches
 
-        field_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key=field,
-                    match=models.MatchText(text=query_lower),
-                )
+        text_filter = models.Filter(
+            should=[
+                models.FieldCondition(key=field, match=models.MatchText(text=q))
+                for q in queries_lower
             ]
         )
 
-        # Combine with any existing hard filters (org / category / etc.)
+        # Combine with any existing hard filters (org / category / etc.) — the
+        # hard filters stay required (must), while at least one query text has
+        # to match (nested should).
         if filter_conditions and filter_conditions.must:
-            combined_must = list(filter_conditions.must) + list(field_filter.must)
-            combined_filter = models.Filter(must=combined_must)
+            combined_filter = models.Filter(must=list(filter_conditions.must) + [text_filter])
         else:
-            combined_filter = field_filter
+            combined_filter = text_filter
 
+        all_points: List = []
         try:
             offset = None
             while True:
@@ -1219,16 +1361,7 @@ class PrioritizedSearchService:
                     scroll_kwargs["offset"] = offset
 
                 points, next_offset = qdrant_client.scroll(**scroll_kwargs)
-
-                for point in points:
-                    source_id = point.payload.get("source_id")
-                    raw_value = point.payload.get(field) or ""
-                    if not source_id or source_id in matches:
-                        continue
-
-                    match_type = self._classify_text_match(query_lower, raw_value.lower())
-                    if match_type:
-                        matches[source_id] = match_type
+                all_points.extend(points)
 
                 if not next_offset:
                     break
@@ -1236,6 +1369,20 @@ class PrioritizedSearchService:
 
         except Exception as exc:
             logger.warning(f"{field} match scroll failed (non-fatal): {exc}")
+            return matches
+
+        for q in queries_lower:
+            matched_this_query: set = set()
+            for point in all_points:
+                source_id = point.payload.get("source_id")
+                if not source_id or source_id in matched_this_query:
+                    continue
+                raw_value = point.payload.get(field) or ""
+                match_type = self._classify_text_match(q, raw_value.lower())
+                if match_type:
+                    matched_this_query.add(source_id)
+                    if matches.get(source_id) != "exact":
+                        matches[source_id] = match_type
 
         logger.info(
             f"{field} match sources found: {len(matches)} "
@@ -1246,7 +1393,7 @@ class PrioritizedSearchService:
 
     def _supplement_matches_from_results(
         self,
-        query: str,
+        queries: List[str],
         ranked_results: List[Dict[str, Any]],
         field: str,
         matches: Dict[str, str],
@@ -1256,19 +1403,25 @@ class PrioritizedSearchService:
         The prefix-tokenized index broadens MatchText recall to prefixes, but a true
         infix query (e.g. 'sur' in 'insurance') may not be retrieved by the scroll.
         This in-memory pass scans the dense candidates' ``field`` payloads with a plain
-        substring check — no extra Qdrant calls — and adds any newly found matches.
+        substring check — no extra Qdrant calls — against every query text (the literal
+        query plus any acronym expansions) and adds any newly found matches, never
+        downgrading a source_id already recorded as "exact".
         """
-        query_lower = query.strip().lower()
-        if not query_lower:
+        queries_lower = list(dict.fromkeys(q.strip().lower() for q in queries if q and q.strip()))
+        if not queries_lower:
             return
         for result in ranked_results:
             source_id = result["payload"].get("source_id")
-            if not source_id or source_id in matches:
+            if not source_id or matches.get(source_id) == "exact":
                 continue
             raw_value = (result["payload"].get(field) or "").lower()
-            match_type = self._classify_text_match(query_lower, raw_value)
-            if match_type:
-                matches[source_id] = match_type
+            for q in queries_lower:
+                match_type = self._classify_text_match(q, raw_value)
+                if match_type == "exact":
+                    matches[source_id] = "exact"
+                    break
+                if match_type == "partial" and source_id not in matches:
+                    matches[source_id] = "partial"
 
     def _apply_field_boost(
         self,
@@ -1450,7 +1603,7 @@ class PrioritizedSearchService:
         query: str,
         filter_conditions: Optional[models.Filter],
     ) -> Dict[str, str]:
-        return self._get_field_match_sources(query, filter_conditions, "title")
+        return self._get_field_match_sources([query], filter_conditions, "title")
 
     def _apply_title_boost(
         self,
